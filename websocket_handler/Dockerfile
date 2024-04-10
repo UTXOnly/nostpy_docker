@@ -1,7 +1,7 @@
 FROM python:3.9-slim
 
 WORKDIR /app
-
+RUN apt update -y
 COPY ws_requirements.txt .
 RUN pip install --no-cache-dir -r ws_requirements.txt
 
