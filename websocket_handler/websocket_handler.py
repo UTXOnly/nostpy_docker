@@ -10,8 +10,6 @@ import websockets
 from aiohttp.client_exceptions import ClientConnectionError
 from logging.handlers import RotatingFileHandler
 
-from datadog import initialize, statsd
-from ddtrace import tracer
 import websockets.exceptions
 
 from websocket_classes import (
@@ -20,12 +18,38 @@ from websocket_classes import (
     WebsocketMessages,
 )
 
+from opentelemetry import trace
+
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.instrumentation.aiohttp_client import (
+    AioHttpClientInstrumentor
+)
+
+#from opentelemetry.sdk.resources import Resource
+#from opentelemetry.semconv.trace import ResourceAttributes
+service_name = "event_handler_otel"
+
+#resource = Resource(attributes={
+#    ResourceAttributes.SERVICE_NAME: service_name,
+#    # Include any other relevant attributes
+#})
+
+AioHttpClientInstrumentor().instrument()
+
+#create your FastAPI app
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+otlp_exporter = OTLPSpanExporter()
+span_processor = BatchSpanProcessor(otlp_exporter) # we don't want to export every single trace by itself but rather batch them
+otlp_tracer = trace.get_tracer_provider().add_span_processor(span_processor)
 
 
-options = {"statsd_host": os.getenv("STATSD_HOST"), "statsd_port": 8125}
-initialize(**options)
 
-tracer.configure(hostname=os.getenv("TRACER_HOST"), port=8126)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -57,13 +81,13 @@ async def handle_websocket_connection(
                     logger.error(f"Error decoding JSON message: {json_error}")
                     continue
 
-                statsd.increment(
-                    "nostr.new_connection.count",
-                    tags=[
-                        f"client_ip:{ws_message.obfuscated_client_ip}",
-                        f"nostr_client:{ws_message.origin}",
-                    ],
-                )
+                #statsd.increment(
+                #    "nostr.new_connection.count",
+                #    tags=[
+                #        f"client_ip:{ws_message.obfuscated_client_ip}",
+                #        f"nostr_client:{ws_message.origin}",
+                #    ],
+                #)
 
                 if not await rate_limiter.check_request(
                     ws_message.obfuscated_client_ip
@@ -77,13 +101,13 @@ async def handle_websocket_connection(
                         "false",
                         "rate-limited: slow your roll nostrich",
                     )
-                    statsd.increment(
-                        "nostr.client.rate_limited.count",
-                        tags=[
-                            f"client_ip:{ws_message.obfuscated_client_ip}",
-                            f"nostr_client:{ws_message.origin}",
-                        ],
-                    )
+                    #statsd.increment(
+                    #    "nostr.client.rate_limited.count",
+                    #    tags=[
+                    #        f"client_ip:{ws_message.obfuscated_client_ip}",
+                    #        f"nostr_client:{ws_message.origin}",
+                    #    ],
+                    #)
                     await websocket.send(json.dumps(rate_limit_response))
                     await websocket.close()
                     return

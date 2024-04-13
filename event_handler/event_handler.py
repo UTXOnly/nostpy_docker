@@ -8,24 +8,59 @@ import psycopg
 import redis
 import uvicorn
 
-from datadog import initialize, statsd
-from ddtrace import tracer
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
+from otel_metrics import PythonOTEL
 from event_classes import Event, Subscription
 from psycopg_pool import AsyncConnectionPool
 
+from opentelemetry import trace
 
-options = {"statsd_host": os.getenv("STATSD_HOST"), "statsd_port": 8125}
-initialize(**options)
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace import TracerProvider
 
+#from opentelemetry.sdk.resources import Resource
+#from opentelemetry.semconv.trace import ResourceAttributes
+from opentelemetry.instrumentation.redis import RedisInstrumentor
+service_name = "event_handler_otel"
+
+
+#resource = Resource(attributes={
+#    ResourceAttributes.SERVICE_NAME: service_name,
+#    # Include any other relevant attributes
+#})
+
+
+#create your FastAPI app
+app = FastAPI()
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+otlp_exporter = OTLPSpanExporter()
+span_processor = BatchSpanProcessor(otlp_exporter) # we don't want to export every single trace by itself but rather batch them
+otlp_tracer = trace.get_tracer_provider().add_span_processor(span_processor)
+
+
+
+py_otel = PythonOTEL()
+
+# Redis client setup
 redis_client = redis.Redis(host=os.getenv("REDIS_HOST"), port=6379)
-tracer.configure(hostname=os.getenv("TRACER_HOST"), port=8126)
-
+RedisInstrumentor().instrument()
+# Logger setup
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+# Add handler to logger
+handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=3)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 
 
 def get_conn_str() -> str:
@@ -46,6 +81,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app)
 
 
 def initialize_db() -> None:
@@ -104,13 +140,14 @@ async def handle_new_event(request: Request) -> JSONResponse:
         async with request.app.async_pool.connection() as conn:
             async with conn.cursor() as cur:
                 if event_obj.kind in [0, 3]:
-                    await event_obj.delete_check(conn, cur, statsd)
+                    await event_obj.delete_check(conn, cur)
                 elif event_obj.kind == 5:
                     if event_obj.verify_signature(logger):
-                        events_to_delete = event_obj.parse_kind5(statsd)
+                        events_to_delete = event_obj.parse_kind5()
                         await event_obj.delete_event(
                             conn, cur, events_to_delete, logger
                         )
+                        py_otel.counter.add(1,py_otel.labels)
                         return event_obj.evt_response(
                             results_status="true", http_status_code=200
                         )
@@ -122,9 +159,6 @@ async def handle_new_event(request: Request) -> JSONResponse:
                 else:
                     try:
                         await event_obj.add_event(conn, cur)
-                        statsd.increment(
-                            "nostr.event.added.count", tags=["func:new_event"]
-                        )
                     except psycopg.IntegrityError:
                         conn.rollback()
                         logger.info(
@@ -155,6 +189,7 @@ async def handle_subscription(request: Request) -> JSONResponse:
     try:
         request_payload = await request.json()
         subscription_obj = Subscription(request_payload)
+        py_otel.counter_query.add(1,py_otel.labels)
 
         if not subscription_obj.filters:
             return subscription_obj.sub_response_builder(
