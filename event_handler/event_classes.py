@@ -78,14 +78,12 @@ class Event:
             logger.error(f"Error verifying signature for event {self.event_id}: {e}")
             return False
 
-    async def delete_check(self, conn, cur, statsd) -> None:
+    async def delete_check(self, conn, cur) -> None:
         delete_query = """
         DELETE FROM events
         WHERE pubkey = %s AND kind = %s;
         """
         await cur.execute(delete_query, (self.pubkey, self.kind))
-        statsd.decrement("nostr.event.added.count", tags=["func:new_event"])
-        statsd.increment("nostr.event.deleted.count", tags=["func:new_event"])
         await conn.commit()
 
     def parse_kind5(self, statsd) -> List:
@@ -313,7 +311,7 @@ class Subscription:
             else:
                 return {}, {}, None, {}
 
-    def base_query_builder(self, tag_values, query_parts, limit, global_search, logger):
+    async def base_query_builder(self, tag_values, query_parts, limit, global_search, logger):
         try:
             if query_parts:
                 self.where_clause = " AND ".join(query_parts)

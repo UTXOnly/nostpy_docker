@@ -210,7 +210,7 @@ async def handle_subscription(request: Request) -> JSONResponse:
             global_search,
         ) = await subscription_obj.parse_filters(subscription_obj.filters, logger)
 
-        sql_query = subscription_obj.base_query_builder(
+        sql_query = await subscription_obj.base_query_builder(
             tag_values, query_parts, limit, global_search, logger
         )
 
