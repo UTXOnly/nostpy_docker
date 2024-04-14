@@ -4,6 +4,22 @@ from typing import List, Tuple, Dict
 from fastapi.responses import JSONResponse
 import secp256k1
 
+from opentelemetry import trace
+
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
+from opentelemetry.semconv.trace import SpanAttributes
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+otlp_exporter = OTLPSpanExporter()
+span_processor = BatchSpanProcessor(otlp_exporter) # we don't want to export every single trace by itself but rather batch them
+otlp_tracer = trace.get_tracer_provider().add_span_processor(span_processor)
+
 
 class Event:
     """
@@ -283,17 +299,19 @@ class Subscription:
             return None
 
     async def parse_filters(self, filters: dict, logger) -> tuple:
-        updated_keys, limit, global_search = await self._sanitize_event_keys(
-            filters, logger
-        )
-        logger.debug(f"Updated keys is: {updated_keys}")
-        if updated_keys:
-            tag_values, query_parts = await self._parse_sanitized_keys(
-                updated_keys, logger
+        with tracer.start_as_current_span("parse filters") as span:
+            current_span = trace.get_current_span()
+            updated_keys, limit, global_search = await self._sanitize_event_keys(
+                filters, logger
             )
-            return tag_values, query_parts, limit, global_search
-        else:
-            return {}, {}, None, {}
+            logger.debug(f"Updated keys is: {updated_keys}")
+            if updated_keys:
+                tag_values, query_parts = await self._parse_sanitized_keys(
+                    updated_keys, logger
+                )
+                return tag_values, query_parts, limit, global_search
+            else:
+                return {}, {}, None, {}
 
     def base_query_builder(self, tag_values, query_parts, limit, global_search, logger):
         try:

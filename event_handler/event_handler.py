@@ -21,45 +21,48 @@ from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
+from opentelemetry.semconv.trace import SpanAttributes
+from opentelemetry.sdk.resources import Resource
+
+
 
 #from opentelemetry.sdk.resources import Resource
 #from opentelemetry.semconv.trace import ResourceAttributes
 from opentelemetry.instrumentation.redis import RedisInstrumentor
-service_name = "event_handler_otel"
 
 
-#resource = Resource(attributes={
-#    ResourceAttributes.SERVICE_NAME: service_name,
-#    # Include any other relevant attributes
-#})
-
-
-#create your FastAPI app
 app = FastAPI()
 
-trace.set_tracer_provider(TracerProvider())
+
+#trace.set_tracer_provider(TracerProvider())
+trace.set_tracer_provider(TracerProvider(resource=Resource.create({"service.name": "eh_otel_test"})))
 tracer = trace.get_tracer(__name__)
 
 otlp_exporter = OTLPSpanExporter()
 span_processor = BatchSpanProcessor(otlp_exporter) # we don't want to export every single trace by itself but rather batch them
 otlp_tracer = trace.get_tracer_provider().add_span_processor(span_processor)
 
-
+#PsycopgInstrumentor().instrument(enable_commenter=True, commenter_options={})
 
 py_otel = PythonOTEL()
 
-# Redis client setup
+# Set up a separate tracer provider for Redis
+redis_tracer_provider = TracerProvider(resource=Resource.create({"service.name": "redis"}))
+redis_tracer = redis_tracer_provider.get_tracer(__name__)
+
+# Set up the OTLP exporter and span processor for Redis
+redis_otlp_exporter = OTLPSpanExporter()
+redis_span_processor = BatchSpanProcessor(redis_otlp_exporter)
+redis_tracer_provider.add_span_processor(redis_span_processor)
+
+# Instrument Redis with the separate tracer provider
+RedisInstrumentor().instrument(tracer_provider=redis_tracer_provider)
 redis_client = redis.Redis(host=os.getenv("REDIS_HOST"), port=6379)
-RedisInstrumentor().instrument()
 # Logger setup
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-# Add handler to logger
-handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=3)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 
 
 
@@ -137,42 +140,45 @@ async def handle_new_event(request: Request) -> JSONResponse:
     )
 
     try:
-        async with request.app.async_pool.connection() as conn:
-            async with conn.cursor() as cur:
-                if event_obj.kind in [0, 3]:
-                    await event_obj.delete_check(conn, cur)
-                elif event_obj.kind == 5:
-                    if event_obj.verify_signature(logger):
-                        events_to_delete = event_obj.parse_kind5()
-                        await event_obj.delete_event(
-                            conn, cur, events_to_delete, logger
-                        )
-                        py_otel.counter.add(1,py_otel.labels)
-                        return event_obj.evt_response(
-                            results_status="true", http_status_code=200
-                        )
+        with tracer.start_as_current_span("add_event") as span:
+            current_span = trace.get_current_span()
+            current_span.set_attribute(SpanAttributes.DB_SYSTEM, "postgresql")
+            async with request.app.async_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    if event_obj.kind in [0, 3]:
+                        await event_obj.delete_check(conn, cur)
+                    elif event_obj.kind == 5:
+                        if event_obj.verify_signature(logger):
+                            events_to_delete = event_obj.parse_kind5()
+                            await event_obj.delete_event(
+                                conn, cur, events_to_delete, logger
+                            )
+                            py_otel.counter.add(1,py_otel.labels)
+                            return event_obj.evt_response(
+                                results_status="true", http_status_code=200
+                            )
+                        else:
+                            return event_obj.evt_response(
+                                results_status="flase", http_status_code=200
+                            )
+    
                     else:
-                        return event_obj.evt_response(
-                            results_status="flase", http_status_code=200
-                        )
-
-                else:
-                    try:
-                        await event_obj.add_event(conn, cur)
-                    except psycopg.IntegrityError:
-                        conn.rollback()
-                        logger.info(
-                            f"Event with ID {event_obj.event_id} already exists"
-                        )
-                        return event_obj.evt_response(
-                            results_status="true",
-                            http_status_code=409,
-                            message="duplicate: already have this event",
-                        )
-
-                return event_obj.evt_response(
-                    results_status="true", http_status_code=200
-                )
+                        try:
+                            await event_obj.add_event(conn, cur)
+                        except psycopg.IntegrityError:
+                            conn.rollback()
+                            logger.info(
+                                f"Event with ID {event_obj.event_id} already exists"
+                            )
+                            return event_obj.evt_response(
+                                results_status="true",
+                                http_status_code=409,
+                                message="duplicate: already have this event",
+                            )
+    
+                    return event_obj.evt_response(
+                        results_status="true", http_status_code=200
+                    )
 
     except Exception:
         logger.debug("Entering gen exc")
@@ -213,39 +219,45 @@ async def handle_subscription(request: Request) -> JSONResponse:
         )
 
         if cached_results is None:
-            async with app.async_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(query=sql_query)
-                    listed = await cur.fetchall()
-                    if listed:
-                        parsed_results = await subscription_obj.query_result_parser(
-                            listed
-                        )
-                        serialized_events = json.dumps(parsed_results)
-                        redis_client.setex(
-                            str(subscription_obj.filters), 240, serialized_events
-                        )
-                        return_response = subscription_obj.sub_response_builder(
-                            "EVENT",
-                            subscription_obj.subscription_id,
-                            serialized_events,
-                            200,
-                        )
-                        return return_response
-
-                    else:
-                        redis_client.setex(str(subscription_obj.filters), 240, "")
-                        return subscription_obj.sub_response_builder(
-                            "EOSE", subscription_obj.subscription_id, "", 200
-                        )
+            with tracer.start_as_current_span("SELECT * FROM EVENTS") as parent:
+                current_span = trace.get_current_span()
+                current_span.set_attribute(SpanAttributes.DB_SYSTEM, "postgresql")
+                current_span.set_attribute(SpanAttributes.DB_STATEMENT, sql_query)
+                current_span.set_attribute("service.name", "postgres")
+                current_span.set_attribute("operation.name", "postgres.query")
+                async with app.async_pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(query=sql_query)
+                        listed = await cur.fetchall()
+                        if listed:
+                            parsed_results = await subscription_obj.query_result_parser(
+                                listed
+                            )
+                            serialized_events = json.dumps(parsed_results)
+                            redis_client.setex(
+                                str(subscription_obj.filters), 240, serialized_events
+                            )
+                            return_response = subscription_obj.sub_response_builder(
+                                "EVENT",
+                                subscription_obj.subscription_id,
+                                serialized_events,
+                                200,
+                            )
+                            return return_response
+    
+                        else:
+                            redis_client.setex(str(subscription_obj.filters), 240, "")
+                            return subscription_obj.sub_response_builder(
+                                "EOSE", subscription_obj.subscription_id, "", 200
+                            )
 
         elif cached_results:
             event_type = "EVENT"
             try:
                 parse_var = json.loads(cached_results.decode("utf-8"))
                 results_json = json.dumps(parse_var)
-            except:
-                logger.warning("Empty cache results, sending EOSE")
+            except Exception as exc:
+                logger.warning("Empty cache results, sending EOSE:")
             if not parse_var:
                 event_type = "EOSE"
                 results_json = ""

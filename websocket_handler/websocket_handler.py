@@ -30,7 +30,6 @@ from opentelemetry.instrumentation.aiohttp_client import (
 
 #from opentelemetry.sdk.resources import Resource
 #from opentelemetry.semconv.trace import ResourceAttributes
-service_name = "event_handler_otel"
 
 #resource = Resource(attributes={
 #    ResourceAttributes.SERVICE_NAME: service_name,
@@ -58,6 +57,28 @@ formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 async def health_check(request):
     return web.Response(text="OK",status=200)
+
+domain_name = "nostpy.serverless-nostr.com"
+version = 0.8
+contact = "bh419@protonmail.com"
+hex_pubkey = "4503baa127bdfd0b054384dc5ba82cb0e2a8367cbdb0629179f00db1a34caacc"
+
+
+
+async def get_data(http_accept):
+    if http_accept and "application/nostr+json" in http_accept.lower():
+        return web.json_response({
+            "name": "{domain_name}",
+            "description": "NostPy relay {version}",
+            "pubkey": "{hex_pubkey}",
+            "contact": "{contact}",
+            "supported_nips": [1, 2, 4, 9, 15, 16, 25, 50, 99],
+            "software": "git+https://github.com/UTXOnly/nost-py.git",
+            "version": "{version}",
+            "site": "https://image.nostr.build/ca2fd20bdd90fe91525ffdd752a2773eb85c2d5a144154d4a0e6227835fa4ae1.jpg"
+        }, status=200)
+    else:
+        return {"message": "Not Found"}
 
 
 
@@ -116,22 +137,28 @@ async def handle_websocket_connection(
                     logger.debug(
                         f"Event to be sent payload is: {ws_message.event_payload} of type {type(ws_message.event_payload)}"
                     )
-                    await send_event_to_handler(
-                        session=session,
-                        event_dict=dict(ws_message.event_payload),
-                        websocket=websocket,
-                    )
+                    with tracer.start_as_current_span("send_event_to_handle") as span:
+                        current_span = trace.get_current_span()
+                        current_span.set_attribute("operation.name", "send.event.handler")
+                        await send_event_to_handler(
+                            session=session,
+                            event_dict=dict(ws_message.event_payload),
+                            websocket=websocket,
+                        )
                 elif ws_message.event_type == "REQ":
                     logger.debug("Entering REQ branch")
                     logger.debug(
                         f"Payload is {ws_message.event_payload} and of type: {type(ws_message.event_payload)}"
                     )
-                    await send_subscription_to_handler(
-                        session=session,
-                        event_dict=ws_message.event_payload,
-                        subscription_id=ws_message.subscription_id,
-                        websocket=websocket,
-                    )
+                    with tracer.start_as_current_span("send_event_to_subscription") as span:
+                        current_span = trace.get_current_span()
+                        current_span.set_attribute("operation.name", "send.event.subscription")
+                        await send_subscription_to_handler(
+                            session=session,
+                            event_dict=ws_message.event_payload,
+                            subscription_id=ws_message.subscription_id,
+                            websocket=websocket,
+                        )
                 elif ws_message.event_type == "CLOSE":
                     response: Tuple[str, str] = (
                         "CLOSED",
@@ -166,8 +193,12 @@ async def send_event_to_handler(
     websocket: websockets.WebSocketServerProtocol,
 ) -> None:
     url: str = "http://localhost/new_event"
+
+
     try:
         async with session.post(url, data=json.dumps(event_dict)) as response:
+            current_span = trace.get_current_span()
+            current_span.set_attribute("operation.name", "post.event.handler")
             response_data: Dict[str, Any] = await response.json()
             logger.debug(
                 f"Received response from Event Handler {response_data}, data types is {type(response_data)}"
@@ -191,8 +222,9 @@ async def send_subscription_to_handler(
         "event_dict": event_dict,
         "subscription_id": subscription_id,
     }
-
     async with session.post(url, data=json.dumps(payload)) as response:
+        current_span = trace.get_current_span()
+        current_span.set_attribute("operation.name", "post.event.subscription")
         response_data = await response.json()
         logger.debug(
             f"Data type of response_data: {type(response_data)}, Response Data: {response_data}"
@@ -205,9 +237,16 @@ async def send_subscription_to_handler(
         EOSE = "EOSE", response_object.subscription_id
 
         if response.status == 200 and response_object.event_type == "EVENT":
-            response_list = await response_object.format_response()
-            await response_object.send_event_loop(response_list, websocket)
-            await websocket.send(json.dumps(EOSE))
+            with tracer.start_as_current_span("format_response") as span:
+                current_span = trace.get_current_span()
+                current_span.set_attribute("operation.name", "format.response")
+                response_list = await response_object.format_response()
+            with tracer.start_as_current_span("send event loop") as span:
+                current_span = trace.get_current_span()
+                current_span.set_attribute("operation.name", "send.event.loop")
+
+                await response_object.send_event_loop(response_list, websocket)
+                await websocket.send(json.dumps(EOSE))
         else:
             await websocket.send(json.dumps(EOSE))
             logger.debug(f"Response data is {response_data} but it failed")
@@ -226,7 +265,8 @@ async def main():
     # Create an HTTP application
     app = web.Application()
     app.router.add_get('/health', health_check)  # Add health check endpoint
-    
+    app.router.add_get('/', get_data)
+
 
     # Start the WebSocket server
     websocket_server = websockets.serve(handle_websocket_connection, "0.0.0.0", 8008)
