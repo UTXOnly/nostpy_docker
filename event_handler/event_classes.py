@@ -17,7 +17,9 @@ trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer(__name__)
 
 otlp_exporter = OTLPSpanExporter()
-span_processor = BatchSpanProcessor(otlp_exporter) # we don't want to export every single trace by itself but rather batch them
+span_processor = BatchSpanProcessor(
+    otlp_exporter
+)  # we don't want to export every single trace by itself but rather batch them
 otlp_tracer = trace.get_tracer_provider().add_span_processor(span_processor)
 
 
@@ -311,7 +313,9 @@ class Subscription:
             else:
                 return {}, {}, None, {}
 
-    async def base_query_builder(self, tag_values, query_parts, limit, global_search, logger):
+    async def base_query_builder(
+        self, tag_values, query_parts, limit, global_search, logger
+    ):
         try:
             if query_parts:
                 self.where_clause = " AND ".join(query_parts)

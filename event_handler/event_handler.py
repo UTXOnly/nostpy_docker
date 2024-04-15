@@ -26,29 +26,34 @@ from opentelemetry.semconv.trace import SpanAttributes
 from opentelemetry.sdk.resources import Resource
 
 
-
-#from opentelemetry.sdk.resources import Resource
-#from opentelemetry.semconv.trace import ResourceAttributes
+# from opentelemetry.sdk.resources import Resource
+# from opentelemetry.semconv.trace import ResourceAttributes
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 
 
 app = FastAPI()
 
 
-#trace.set_tracer_provider(TracerProvider())
-trace.set_tracer_provider(TracerProvider(resource=Resource.create({"service.name": "eh_otel_test"})))
+# trace.set_tracer_provider(TracerProvider())
+trace.set_tracer_provider(
+    TracerProvider(resource=Resource.create({"service.name": "eh_otel_test"}))
+)
 tracer = trace.get_tracer(__name__)
 
 otlp_exporter = OTLPSpanExporter()
-span_processor = BatchSpanProcessor(otlp_exporter) # we don't want to export every single trace by itself but rather batch them
+span_processor = BatchSpanProcessor(
+    otlp_exporter
+)  # we don't want to export every single trace by itself but rather batch them
 otlp_tracer = trace.get_tracer_provider().add_span_processor(span_processor)
 
-#PsycopgInstrumentor().instrument(enable_commenter=True, commenter_options={})
+# PsycopgInstrumentor().instrument(enable_commenter=True, commenter_options={})
 
 py_otel = PythonOTEL()
 
 # Set up a separate tracer provider for Redis
-redis_tracer_provider = TracerProvider(resource=Resource.create({"service.name": "redis"}))
+redis_tracer_provider = TracerProvider(
+    resource=Resource.create({"service.name": "redis"})
+)
 redis_tracer = redis_tracer_provider.get_tracer(__name__)
 
 # Set up the OTLP exporter and span processor for Redis
@@ -63,7 +68,6 @@ redis_client = redis.Redis(host=os.getenv("REDIS_HOST"), port=6379)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
 
 
 def get_conn_str() -> str:
@@ -153,7 +157,7 @@ async def handle_new_event(request: Request) -> JSONResponse:
                             await event_obj.delete_event(
                                 conn, cur, events_to_delete, logger
                             )
-                            py_otel.counter.add(1,py_otel.labels)
+                            py_otel.counter.add(1, py_otel.labels)
                             return event_obj.evt_response(
                                 results_status="true", http_status_code=200
                             )
@@ -161,7 +165,7 @@ async def handle_new_event(request: Request) -> JSONResponse:
                             return event_obj.evt_response(
                                 results_status="flase", http_status_code=200
                             )
-    
+
                     else:
                         try:
                             await event_obj.add_event(conn, cur)
@@ -175,7 +179,7 @@ async def handle_new_event(request: Request) -> JSONResponse:
                                 http_status_code=409,
                                 message="duplicate: already have this event",
                             )
-    
+
                     return event_obj.evt_response(
                         results_status="true", http_status_code=200
                     )
@@ -195,7 +199,7 @@ async def handle_subscription(request: Request) -> JSONResponse:
     try:
         request_payload = await request.json()
         subscription_obj = Subscription(request_payload)
-        py_otel.counter_query.add(1,py_otel.labels)
+        py_otel.counter_query.add(1, py_otel.labels)
 
         if not subscription_obj.filters:
             return subscription_obj.sub_response_builder(
@@ -229,27 +233,6 @@ async def handle_subscription(request: Request) -> JSONResponse:
                     async with conn.cursor() as cur:
                         await cur.execute(query=sql_query)
                         listed = await cur.fetchall()
-                        if listed:
-                            parsed_results = await subscription_obj.query_result_parser(
-                                listed
-                            )
-                            serialized_events = json.dumps(parsed_results)
-                            redis_client.setex(
-                                str(subscription_obj.filters), 240, serialized_events
-                            )
-                            return_response = subscription_obj.sub_response_builder(
-                                "EVENT",
-                                subscription_obj.subscription_id,
-                                serialized_events,
-                                200,
-                            )
-                            return return_response
-    
-                        else:
-                            redis_client.setex(str(subscription_obj.filters), 240, "")
-                            return subscription_obj.sub_response_builder(
-                                "EOSE", subscription_obj.subscription_id, "", 200
-                            )
 
         elif cached_results:
             event_type = "EVENT"
@@ -265,10 +248,33 @@ async def handle_subscription(request: Request) -> JSONResponse:
                 event_type, subscription_obj.subscription_id, results_json, 200
             )
 
+        #else:
+        #    return subscription_obj.sub_response_builder(
+        #        "EOSE", subscription_obj.subscription_id, "", 200
+        #    )
+        if listed:
+            parsed_results = await subscription_obj.query_result_parser(
+                listed
+            )
+            serialized_events = json.dumps(parsed_results)
+            redis_client.setex(
+                str(subscription_obj.filters), 240, serialized_events
+            )
+            return_response = subscription_obj.sub_response_builder(
+                "EVENT",
+                subscription_obj.subscription_id,
+                serialized_events,
+                200,
+            )
+            return return_response
+
         else:
+            redis_client.setex(str(subscription_obj.filters), 240, "")
             return subscription_obj.sub_response_builder(
                 "EOSE", subscription_obj.subscription_id, "", 200
             )
+
+
 
     except psycopg.Error as exc:
         logger.error(f"Error occurred: {str(exc)}", exc_info=True)
