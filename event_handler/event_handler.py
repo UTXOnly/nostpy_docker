@@ -253,10 +253,13 @@ async def handle_subscription(request: Request) -> JSONResponse:
         #        "EOSE", subscription_obj.subscription_id, "", 200
         #    )
         if listed:
-            parsed_results = await subscription_obj.query_result_parser(
-                listed
-            )
-            serialized_events = json.dumps(parsed_results)
+            with tracer.start_as_current_span("query_result_parser") as parent:
+                current_span = trace.get_current_span()
+                current_span.set_attribute("operation.name", "query.result.parse")
+                parsed_results = await subscription_obj.query_result_parser(
+                    listed
+                )
+                serialized_events = json.dumps(parsed_results)
             redis_client.setex(
                 str(subscription_obj.filters), 240, serialized_events
             )
